@@ -4,7 +4,7 @@ from dataclasses import replace
 import pytest
 
 from jitkv.simulator import SimConfig, Simulator
-from jitkv.strategies import cpu_buffered_pull, direct_pull
+from jitkv.strategies import cpu_buffered_pull, direct_pull, push
 from jitkv.trace import Request
 
 # Chosen so that a 1,000-token prompt with 10 output tokens spends a distinct
@@ -17,7 +17,7 @@ CONFIG = SimConfig(
     decode_s_per_token=0.8,
 )
 
-ALL_STRATEGIES = [direct_pull, cpu_buffered_pull]
+ALL_STRATEGIES = [push, direct_pull, cpu_buffered_pull]
 
 
 def request(id=0, arrival_s=0.0):
@@ -59,7 +59,7 @@ def test_request_waits_for_a_free_slot():
     # The first request holds the slot until it finishes at t=15.
     assert first.finish_s == pytest.approx(15.0)
     assert second.transfer_end_s == pytest.approx(3.5)
-    assert second.admitted_s == pytest.approx(15.0)
+    assert second.slot_acquired_s == pytest.approx(15.0)
     assert second.decode_start_s == pytest.approx(19.0)
     assert second.ttft_s == pytest.approx(18.5)
 
@@ -70,7 +70,7 @@ def test_request_waits_for_free_memory():
 
     _, second = Simulator(config, cpu_buffered_pull).run(two_requests())
 
-    assert second.admitted_s == pytest.approx(15.0)
+    assert second.memory_reserved_s == pytest.approx(15.0)
 
 
 def test_smaller_request_does_not_overtake_the_front_of_the_line():
@@ -85,9 +85,9 @@ def test_smaller_request_does_not_overtake_the_front_of_the_line():
 
     # Large joins the line at t=6 and small at t=6.5. Small would fit next to
     # the running request, but it stays behind large until large finishes.
-    assert large_record.admitted_s == pytest.approx(15.0)
+    assert large_record.memory_reserved_s == pytest.approx(15.0)
     assert large_record.finish_s == pytest.approx(31.0)
-    assert small_record.admitted_s == pytest.approx(31.0)
+    assert small_record.memory_reserved_s == pytest.approx(31.0)
 
 
 def test_rejects_request_larger_than_gpu_memory():
@@ -120,7 +120,8 @@ def test_random_workload_finishes_within_gpu_limits(strategy):
     changes = []
     for record in records:
         kv_bytes = record.request.input_tokens * config.kv_bytes_per_token
-        changes.append((record.admitted_s, 1, 1, kv_bytes))
+        changes.append((record.slot_acquired_s, 1, 1, 0))
+        changes.append((record.memory_reserved_s, 1, 0, kv_bytes))
         changes.append((record.finish_s, 0, -1, -kv_bytes))
     slots_used = memory_used = 0
     for _, _, slot_change, memory_change in sorted(changes):

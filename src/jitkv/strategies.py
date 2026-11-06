@@ -7,6 +7,19 @@ decides how long GPU memory and slots sit reserved before decode can use them.
 from jitkv.simulator import RequestRecord, Simulator, Steps
 
 
+def push(sim: Simulator, record: RequestRecord) -> Steps:
+    """Reserves GPU memory before prefill, then writes the KV cache directly.
+
+    The KV cache is ready as soon as a slot frees, but it holds GPU memory
+    throughout prefill, the transfer, and any wait for a slot.
+    """
+    yield from sim.wait_for_memory(record)
+    yield from sim.prefill(record)
+    yield from sim.network_transfer(record)
+    yield from sim.wait_for_slot(record)
+    yield from sim.decode(record)
+
+
 def direct_pull(sim: Simulator, record: RequestRecord) -> Steps:
     """Keeps the KV cache on the prefill GPU until the decode GPU has room.
 

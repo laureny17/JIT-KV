@@ -36,24 +36,24 @@ class SimConfig:
 
 
 class DecodeGpu:
-    """Tracks the slots and memory that admitted requests hold."""
+    """Tracks the slots and memory that requests hold."""
 
     def __init__(self, slots: int, memory_bytes: int) -> None:
         self._free_slots = slots
         self._free_memory_bytes = memory_bytes
 
-    def can_reserve(self, kv_bytes: int) -> bool:
-        return self._free_slots > 0 and kv_bytes <= self._free_memory_bytes
+    def can_reserve(self, slots: int, memory_bytes: int) -> bool:
+        return slots <= self._free_slots and memory_bytes <= self._free_memory_bytes
 
-    def reserve(self, kv_bytes: int) -> None:
-        if not self.can_reserve(kv_bytes):
-            raise RuntimeError(f"no room to reserve {kv_bytes} bytes")
-        self._free_slots -= 1
-        self._free_memory_bytes -= kv_bytes
+    def reserve(self, slots: int, memory_bytes: int) -> None:
+        if not self.can_reserve(slots, memory_bytes):
+            raise RuntimeError(f"no room for {slots} slots, {memory_bytes} bytes")
+        self._free_slots -= slots
+        self._free_memory_bytes -= memory_bytes
 
-    def release(self, kv_bytes: int) -> None:
-        self._free_slots += 1
-        self._free_memory_bytes += kv_bytes
+    def release(self, slots: int, memory_bytes: int) -> None:
+        self._free_slots += slots
+        self._free_memory_bytes += memory_bytes
 
 
 @dataclass
@@ -64,8 +64,8 @@ class RequestRecord:
     """
 
     request: Request
-    # When the request got its GPU slot and memory.
-    admitted_s: float | None = None
+    memory_reserved_s: float | None = None
+    slot_acquired_s: float | None = None
     prefill_end_s: float | None = None
     transfer_end_s: float | None = None
     copy_end_s: float | None = None
@@ -81,7 +81,8 @@ class RequestRecord:
 
 @dataclass
 class _Waiter:
-    kv_bytes: int
+    slots: int
+    memory_bytes: int
     resume: Resume
 
 
@@ -93,7 +94,11 @@ class Simulator:
         self._strategy = strategy
         self._loop = EventLoop()
         self._gpu = DecodeGpu(config.decode_slots, config.decode_memory_bytes)
-        self._waiting: deque[_Waiter] = deque()
+        # Separate lines keep a request that already holds memory and only needs
+        # a slot from being stuck behind a request waiting for memory, which
+        # could otherwise deadlock.
+        self._memory_line: deque[_Waiter] = deque()
+        self._admission_line: deque[_Waiter] = deque()
 
     def run(self, requests: Iterable[Request]) -> list[RequestRecord]:
         records = [RequestRecord(request) for request in requests]
@@ -111,9 +116,18 @@ class Simulator:
 
     # The stages a request can go through. Strategies choose their order.
 
+    def wait_for_memory(self, record: RequestRecord) -> Steps:
+        yield self._wait_in_line(self._memory_line, 0, self._kv_bytes(record))
+        record.memory_reserved_s = self._loop.now
+
+    def wait_for_slot(self, record: RequestRecord) -> Steps:
+        yield self._wait_in_line(self._admission_line, 1, 0)
+        record.slot_acquired_s = self._loop.now
+
     def wait_for_slot_and_memory(self, record: RequestRecord) -> Steps:
-        yield self._wait_in_line(self._kv_bytes(record))
-        record.admitted_s = self._loop.now
+        yield self._wait_in_line(self._admission_line, 1, self._kv_bytes(record))
+        record.memory_reserved_s = self._loop.now
+        record.slot_acquired_s = self._loop.now
 
     def prefill(self, record: RequestRecord) -> Steps:
         yield self._sleep(record.request.input_tokens / self._config.prefill_tokens_per_s)
@@ -131,8 +145,8 @@ class Simulator:
         record.decode_start_s = self._loop.now
         yield self._sleep(record.request.output_tokens * self._config.decode_s_per_token)
         record.finish_s = self._loop.now
-        self._gpu.release(self._kv_bytes(record))
-        self._admit_waiting()
+        self._gpu.release(1, self._kv_bytes(record))
+        self._serve_lines()
 
     # Internals.
 
@@ -153,20 +167,23 @@ class Simulator:
 
         return pause
 
-    def _wait_in_line(self, kv_bytes: int) -> Pause:
+    def _wait_in_line(
+        self, line: deque[_Waiter], slots: int, memory_bytes: int
+    ) -> Pause:
         def pause(resume: Resume) -> None:
-            self._waiting.append(_Waiter(kv_bytes, resume))
-            self._admit_waiting()
+            line.append(_Waiter(slots, memory_bytes, resume))
+            self._serve_lines()
 
         return pause
 
-    def _admit_waiting(self) -> None:
-        # Admit in the order requests joined the line. A smaller request never
-        # overtakes the request at the front, even if it would fit.
-        while self._waiting and self._gpu.can_reserve(self._waiting[0].kv_bytes):
-            waiter = self._waiting.popleft()
-            self._gpu.reserve(waiter.kv_bytes)
-            waiter.resume()
+    def _serve_lines(self) -> None:
+        # Serve each line in order. A request never overtakes the one at the
+        # front of its line, even if it would fit.
+        for line in (self._memory_line, self._admission_line):
+            while line and self._gpu.can_reserve(line[0].slots, line[0].memory_bytes):
+                waiter = line.popleft()
+                self._gpu.reserve(waiter.slots, waiter.memory_bytes)
+                waiter.resume()
 
     def _kv_bytes(self, record: RequestRecord) -> int:
         return record.request.input_tokens * self._config.kv_bytes_per_token
