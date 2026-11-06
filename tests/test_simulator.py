@@ -4,7 +4,7 @@ from dataclasses import replace
 import pytest
 
 from jitkv.simulator import SimConfig, Simulator
-from jitkv.strategies import cpu_buffered_pull
+from jitkv.strategies import cpu_buffered_pull, direct_pull
 from jitkv.trace import Request
 
 # Chosen so that a 1,000-token prompt with 10 output tokens spends a distinct
@@ -17,7 +17,7 @@ CONFIG = SimConfig(
     decode_s_per_token=0.8,
 )
 
-ALL_STRATEGIES = [cpu_buffered_pull]
+ALL_STRATEGIES = [direct_pull, cpu_buffered_pull]
 
 
 def request(id=0, arrival_s=0.0):
